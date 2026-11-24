@@ -1328,6 +1328,15 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_up_to(now, was, usize::MAX).expect("a slice cannot hold more than usize::MAX runs")
+}
+
+/// [`changed_runs`], or `None` as soon as another run would exceed `limit`.
+/// Nothing is changed on rejection: the caller can settle the flights
+/// before putting any of this page's bytes into the copy.
+// Inlining lets the unlimited caller discard the budget check.
+#[inline]
+fn changed_runs_up_to(now: &[u8], was: &[u8], limit: usize) -> Option<Vec<(usize, usize)>> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -1342,18 +1351,23 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         if i >= n {
             break;
         }
+        // The first differing byte already proves there is another run.
+        // Do not scan its rest or allocate it if the page must be refused.
+        if runs.len() == limit {
+            return None;
+        }
         let first = i;
         while i < n && now[i] != was[i] {
             i += 1;
         }
         runs.push((first, i - first));
     }
-    runs
+    Some(runs)
 }
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, changed_runs_up_to};
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -1379,6 +1393,170 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// An independent byte-wise oracle extends the last run rather than
+    /// searching for its end as the production scanner does.
+    fn runs_by_byte(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, (&n, &w)) in now.iter().zip(was).enumerate() {
+            if n != w {
+                match runs.last_mut() {
+                    Some((at, len)) if *at + *len == i => *len += 1,
+                    _ => runs.push((i, 1)),
+                }
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn bounded_runs_agree_with_every_short_pattern() {
+        for len in 0..=12 {
+            let was: Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
+            for mask in 0..1usize << len {
+                let now: Vec<u8> = was
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &w)| w ^ if mask & (1 << i) != 0 { 0x80 } else { 0 })
+                    .collect();
+                let expected = runs_by_byte(&now, &was);
+                assert_eq!(changed_runs(&now, &was), expected);
+                for limit in [
+                    0,
+                    1,
+                    expected.len().saturating_sub(1),
+                    expected.len(),
+                    expected.len() + 1,
+                    len,
+                ] {
+                    let bounded = changed_runs_up_to(&now, &was, limit);
+                    if expected.len() <= limit {
+                        assert_eq!(
+                            bounded.as_ref(),
+                            Some(&expected),
+                            "len={len}, mask={mask:#x}, limit={limit}"
+                        );
+                    } else {
+                        assert!(
+                            bounded.is_none(),
+                            "len={len}, mask={mask:#x}, limit={limit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_pages_are_rejected_without_changing_the_inputs() {
+        const SIZE: usize = 64 << 10;
+        const LIMIT: usize = 512;
+        let was = vec![0u8; SIZE];
+        let mut now: Vec<u8> = (0..SIZE).map(|i| (i % 2 == 0) as u8).collect();
+        let original = now.clone();
+        assert_eq!(runs_by_byte(&now, &was).len(), SIZE / 2);
+        assert!(changed_runs_up_to(&now, &was, LIMIT).is_none());
+        assert_eq!(now, original);
+        assert!(was.iter().all(|&b| b == 0));
+
+        // The first byte of this long run exceeds the budget: its end
+        // need not be found before the page is refused.
+        now[2 * LIMIT..].fill(1);
+        let original = now.clone();
+        assert!(changed_runs_up_to(&now, &was, LIMIT).is_none());
+        assert_eq!(now, original);
+        assert_eq!(changed_runs_up_to(&was, &was, 0), Some(Vec::new()));
+    }
+
+    /// CPU only; run with `cargo test --release -p victory-gpu
+    /// shadow::merge_tests::bounded_run_scan -- --ignored --nocapture`.
+    /// Timings describe these synthetic patterns, not game frame times.
+    #[test]
+    #[ignore = "CPU-only microbenchmark"]
+    fn bounded_run_scan() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // The original scanner, kept here so the unlimited wrapper's
+        // cost is measured against code with no budget check at all.
+        fn original_changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+            let n = now.len().min(was.len());
+            let mut runs = Vec::new();
+            let mut i = 0;
+            while i < n {
+                // Equal bytes, eight at a time while they last.
+                while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+                    i += 8;
+                }
+                while i < n && now[i] == was[i] {
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                let first = i;
+                while i < n && now[i] != was[i] {
+                    i += 1;
+                }
+                runs.push((first, i - first));
+            }
+            runs
+        }
+
+        const SIZE: usize = 64 << 10;
+        const LIMIT: usize = 512;
+        const ITERATIONS: usize = 64;
+        let was = vec![0u8; SIZE];
+        let mut sparse = was.clone();
+        for at in [0, SIZE / 2, SIZE - 1] {
+            sparse[at] = 1;
+        }
+        let alternating: Vec<u8> = (0..SIZE).map(|i| (i % 2 == 0) as u8).collect();
+        let mut excess_run = alternating.clone();
+        excess_run[2 * LIMIT..].fill(1);
+        for (name, now) in [
+            ("unchanged", was.clone()),
+            ("dense", vec![1; SIZE]),
+            ("sparse", sparse),
+            ("alternating", alternating),
+            ("excess long run", excess_run),
+        ] {
+            let legacy = || {
+                let runs = original_changed_runs(black_box(&now), black_box(&was));
+                (runs.len() <= LIMIT).then_some(runs)
+            };
+            let unlimited = || {
+                let runs = changed_runs(black_box(&now), black_box(&was));
+                (runs.len() <= LIMIT).then_some(runs)
+            };
+            let bounded = || changed_runs_up_to(black_box(&now), black_box(&was), LIMIT);
+            assert_eq!(
+                original_changed_runs(&now, &was),
+                changed_runs(&now, &was),
+                "{name}"
+            );
+            assert_eq!(legacy(), unlimited(), "{name}");
+            assert_eq!(legacy(), bounded(), "{name}");
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let _ = black_box(legacy());
+            }
+            let old_full = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let _ = black_box(unlimited());
+            }
+            let new_unlimited = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let _ = black_box(bounded());
+            }
+            println!(
+                "{name}: {ITERATIONS} scans of {SIZE} bytes, old full {old_full:?}, new unlimited {new_unlimited:?}, bounded {:?}",
+                started.elapsed()
+            );
+        }
     }
 }
 
@@ -2298,10 +2476,9 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
+                    let Some(runs) = changed_runs_up_to(title, held, *runs_left) else {
                         return true;
-                    }
+                    };
                     *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
