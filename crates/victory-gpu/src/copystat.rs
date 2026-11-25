@@ -127,8 +127,13 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Queued mapping ranges consumed by a texture pass, the joined ranges
+    /// queried against its placed views, and microseconds invalidating them.
+    RemapRanges,
+    RemapQueries,
+    RemapUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = C::RemapUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1055,6 +1060,12 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    tracing::info!(
+        "texture remap invalidation per frame: {:.0} queued ranges, {:.0} joined range queries, {:.3} ms",
+        c[C::RemapRanges as usize],
+        c[C::RemapQueries as usize],
+        ms(c[C::RemapUs as usize]),
+    );
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \

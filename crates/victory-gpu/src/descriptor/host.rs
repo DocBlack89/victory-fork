@@ -187,6 +187,29 @@ impl Spans {
     }
 }
 
+/// Mapping events in order, joining only ranges that overlap or touch.
+/// Isolated zero-length events are kept: `slots_in` conservatively finds
+/// a view containing such a point, and this pass keeps that behavior.
+/// The input is already owned by the consumer, so it is compacted in place.
+fn joined_remappings(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
+    ranges.sort_unstable();
+    let mut kept = 0;
+    for read in 0..ranges.len() {
+        let (start, end) = ranges[read];
+        if kept != 0 && start <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(end);
+        } else {
+            ranges[kept] = (start, end);
+            kept += 1;
+        }
+    }
+    ranges.truncate(kept);
+    ranges
+}
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -832,10 +855,19 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        let raw_ranges = ranges.len();
+        // Join after draining, outside both the producer's mutex and the
+        // span index's: repeated events should not repeat its lookups.
+        let ranges = joined_remappings(ranges);
+        #[cfg(feature = "diagnostics")]
+        let queries = ranges.len();
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
@@ -848,6 +880,13 @@ impl HostHeap {
             textures.changed(slot, frame, frame + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::RemapRanges, raw_ranges as u64);
+            add(C::RemapQueries, queries as u64);
+            add(C::RemapUs, started.elapsed().as_micros() as u64);
+        }
         slots.len()
     }
 
@@ -2384,6 +2423,233 @@ mod tests {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    /// The consumer's queries and final deduplication, using the real span
+    /// index. The range joining itself is the production helper above.
+    fn remapping_slots(spans: &Spans, ranges: &[(u64, u64)]) -> Vec<u32> {
+        let mut slots: Vec<u32> = ranges
+            .iter()
+            .flat_map(|&(start, end)| spans.slots_in(start, end))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// Independent interval comparisons, without the span index or union.
+    /// Legacy point events match a view only strictly inside its span.
+    fn remapping_slots_by_byte_ranges(
+        views: &[(u32, u64, u64)],
+        ranges: &[(u64, u64)],
+    ) -> Vec<u32> {
+        let mut slots: Vec<u32> = views
+            .iter()
+            .filter(|&&(_, from, to)| {
+                ranges.iter().any(|&(start, end)| {
+                    if start == end {
+                        from < start && start < to
+                    } else {
+                        from < end && start < to
+                    }
+                })
+            })
+            .map(|&(slot, _, _)| slot)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    #[test]
+    fn remapping_unions_keep_gaps_points_and_extreme_ends() {
+        let ranges = vec![
+            (5, 10),
+            (0, 2),
+            (2, 3),
+            (8, 12),
+            (20, 20),
+            (20, 21),
+            (14, 14),
+            (u64::MAX, u64::MAX),
+            (u64::MAX - 1, u64::MAX),
+        ];
+        let (allocation, capacity) = (ranges.as_ptr(), ranges.capacity());
+        let joined = joined_remappings(ranges);
+        assert_eq!(
+            joined,
+            [
+                (0, 3),
+                (5, 12),
+                (14, 14),
+                (20, 21),
+                (u64::MAX - 1, u64::MAX)
+            ]
+        );
+        assert_eq!((joined.as_ptr(), joined.capacity()), (allocation, capacity));
+
+        let views = [
+            (1, 0, 2),
+            (9, 0, 2),
+            (2, 2, 4),
+            (8, 4, 5),
+            (3, 7, 9),
+            (7, 10, 12),
+            (99, u64::MAX - 4, u64::MAX),
+        ];
+        let mut spans = Spans::default();
+        for &(slot, start, end) in &views {
+            assert!(spans.note(slot, start, end, false).is_empty());
+        }
+        for events in [
+            vec![],
+            vec![(0, 0)],
+            vec![(1, 1)],
+            vec![(2, 2)],
+            vec![(3, 3)],
+            vec![(4, 4)],
+            vec![(6, 6)],
+            vec![(0, 2), (2, 2)],
+            vec![(1, 1), (1, 2)],
+            vec![(4, 4), (2, 4)],
+            vec![(0, 2), (7, 9)],
+            vec![(u64::MAX - 4, u64::MAX - 4)],
+            vec![(u64::MAX - 3, u64::MAX - 3)],
+            vec![(u64::MAX, u64::MAX)],
+            vec![(u64::MAX - 4, u64::MAX), (u64::MAX, u64::MAX)],
+        ] {
+            let expected = remapping_slots_by_byte_ranges(&views, &events);
+            assert_eq!(
+                remapping_slots(&spans, &events),
+                expected,
+                "legacy {events:?}"
+            );
+            let joined = joined_remappings(events.clone());
+            assert_eq!(
+                remapping_slots(&spans, &joined),
+                expected,
+                "joined {events:?}"
+            );
+        }
+        // A hole between events stays a hole: the texture at [2, 4) is
+        // not invalidated by events covering only [0, 2) and [7, 9).
+        assert_eq!(
+            remapping_slots(&spans, &joined_remappings(vec![(0, 2), (7, 9)])),
+            [1, 3, 9]
+        );
+    }
+
+    #[test]
+    fn remapping_unions_match_all_small_event_sequences() {
+        let views = [(8, 0, 2), (3, 0, 2), (4, 2, 3), (1, 4, 6)];
+        let mut spans = Spans::default();
+        for &(slot, start, end) in &views {
+            assert!(spans.note(slot, start, end, false).is_empty());
+        }
+        // Every sequence of up to three intervals with endpoints 0..=6,
+        // including points: all orderings, repeats, nesting and touching.
+        let ranges: Vec<(u64, u64)> = (0..=6).flat_map(|a| (a..=6).map(move |b| (a, b))).collect();
+        let check = |events: Vec<(u64, u64)>| {
+            let expected = remapping_slots_by_byte_ranges(&views, &events);
+            assert_eq!(
+                remapping_slots(&spans, &events),
+                expected,
+                "legacy {events:?}"
+            );
+            let joined = joined_remappings(events.clone());
+            assert!(joined.windows(2).all(|w| w[0].1 < w[1].0));
+            assert_eq!(
+                remapping_slots(&spans, &joined),
+                expected,
+                "joined {events:?}"
+            );
+        };
+        check(Vec::new());
+        for &a in &ranges {
+            check(vec![a]);
+            for &b in &ranges {
+                check(vec![a, b]);
+                for &c in &ranges {
+                    check(vec![a, b, c]);
+                }
+            }
+        }
+    }
+
+    /// CPU only: `cargo test --release -p victory-gpu
+    /// descriptor::host::tests::remapping_union_lookups -- --ignored --nocapture`.
+    /// These timings do not predict game frame times.
+    #[test]
+    #[ignore = "CPU-only microbenchmark"]
+    fn remapping_union_lookups() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const EVENTS: usize = 8192;
+        const SLOTS: u32 = 1024;
+        const ITERATIONS: usize = 100;
+        let mut spans = Spans::default();
+        // Two views of each texture, with gaps between textures.
+        for slot in 0..SLOTS {
+            let start = u64::from(slot / 2) * 64 + 16;
+            assert!(spans.note(slot, start, start + 32, false).is_empty());
+        }
+        for (name, events) in [
+            (
+                "overlapping repeated",
+                (0..EVENTS)
+                    .map(|i| {
+                        let a = (i % 64) as u64 * 64;
+                        (a, a + 96)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "sparse disjoint",
+                (0..512)
+                    .rev()
+                    .map(|i| {
+                        let a = i * 64 + 16;
+                        (a, a + 32)
+                    })
+                    .collect(),
+            ),
+            ("singleton", vec![(16, 48)]),
+        ] {
+            let joined = joined_remappings(events.clone());
+            let old_items: usize = events
+                .iter()
+                .map(|&(a, b)| spans.slots_in(a, b).len())
+                .sum();
+            let new_items: usize = joined
+                .iter()
+                .map(|&(a, b)| spans.slots_in(a, b).len())
+                .sum();
+            let expected = remapping_slots(&spans, &events);
+            assert_eq!(remapping_slots(&spans, &joined), expected, "{name}");
+            assert!(events.len() <= EVENTS && old_items <= 4 * EVENTS);
+            // At most 32,768 slot IDs are materialized before dedup in
+            // these fixtures (128 KiB of values); events hold 128 KiB.
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let events = black_box(events.clone());
+                let _ = black_box(remapping_slots(black_box(&spans), &events));
+            }
+            let old = started.elapsed();
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let joined = joined_remappings(black_box(events.clone()));
+                let _ = black_box(remapping_slots(black_box(&spans), &joined));
+            }
+            println!(
+                "{name}: {SLOTS} slots, {} -> {} range queries, {old_items} -> {new_items} materialized slot IDs ({} -> {} bytes); {ITERATIONS} passes, old {old:?}, union {:?}",
+                events.len(),
+                joined.len(),
+                old_items * size_of::<u32>(),
+                new_items * size_of::<u32>(),
+                started.elapsed()
+            );
+        }
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
