@@ -106,15 +106,25 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and the process's commit headroom, in bytes.
+fn available_system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    available_system_memory().map(|m| m.0)
+}
+
+/// Bytes the process can still commit, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_commit_headroom() -> Option<u64> {
+    available_system_memory().map(|m| m.1)
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -137,6 +147,22 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         MODERATE_MS
     } else {
         NORMAL_MS
+    }
+}
+
+/// Idle timeout for recreatable host textures. Low system commit headroom
+/// uses the same one-second floor as high VRAM pressure: there may be room
+/// on the card while the process can no longer commit its backing memory.
+/// Missing commit information preserves the VRAM-only policy. The sweep
+/// still requires four idle frames and no list or descriptor references.
+pub(crate) fn texture_idle_ms(
+    video_memory: Option<[u64; 4]>,
+    available_commit: Option<u64>,
+) -> u64 {
+    if available_commit.is_some_and(|left| left < 4 << 30) {
+        1_000
+    } else {
+        vram_idle_ms(video_memory)
     }
 }
 
@@ -7301,6 +7327,39 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    /// A commit shortage must be noticed even with ample VRAM, but the
+    /// established one-second floor and the VRAM policy otherwise remain.
+    #[test]
+    fn texture_idle_ms_also_scales_with_commit_headroom() {
+        use super::texture_idle_ms;
+        const GIB: u64 = 1 << 30;
+        for (video, normal) in [
+            (None, 5_000),
+            (Some([0, 100, 0, 0]), 5_000),
+            (Some([100, 74, 0, 0]), 5_000),
+            (Some([100, 75, 0, 0]), 2_500),
+            (Some([100, 84, 0, 0]), 2_500),
+            (Some([100, 85, 0, 0]), 1_000),
+            (Some([100, 120, 0, 0]), 1_000),
+            (Some([u64::MAX, u64::MAX, 0, 0]), 1_000),
+        ] {
+            for available in [None, Some(4 * GIB), Some(4 * GIB + 1), Some(u64::MAX)] {
+                assert_eq!(
+                    texture_idle_ms(video, available),
+                    normal,
+                    "{video:?}, {available:?}"
+                );
+            }
+            for available in [0, 1, 3 * GIB, 4 * GIB - 1] {
+                assert_eq!(
+                    texture_idle_ms(video, Some(available)),
+                    1_000,
+                    "{video:?}, {available}"
+                );
+            }
+        }
     }
 
     #[test]
