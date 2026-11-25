@@ -1119,6 +1119,15 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
+    /// A placed texture's title-memory size, cached by its complete
+    /// resource description. Contents and page mappings do not affect it.
+    pub(crate) fn placed_texture_bytes(&self, desc: &[u32; 14]) -> Option<u64> {
+        self.placed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes(desc)
+    }
+
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
@@ -3043,6 +3052,33 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Distinct widths (including the high word) and invalid formats must
+    /// retain their own answers, including `None`, on repeated cache hits.
+    #[test]
+    fn placed_texture_sizes_are_cached_by_complete_description() {
+        let texture = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut wider = texture;
+        wider[4] = 1024;
+        let mut too_wide = texture;
+        too_wide[5] = 1;
+        let mut invalid_format = texture;
+        invalid_format[8] = u32::MAX;
+        let descriptions = [texture, wider, too_wide, invalid_format];
+        let expected = descriptions.map(|desc| crate::resource::placed_bytes(&desc));
+        assert!(expected[0].is_some());
+        assert!(expected[1].is_some_and(|bytes| bytes > expected[0].unwrap()));
+        assert_ne!(expected[2], expected[0]);
+        assert_eq!(expected[3], None);
+
+        let mut spans = Spans::default();
+        for _ in 0..4 {
+            for (desc, expected) in descriptions.iter().zip(expected).rev() {
+                assert_eq!(spans.bytes(desc), expected, "{desc:?}");
+            }
+        }
+        assert_eq!(spans.sizes.len(), descriptions.len());
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
