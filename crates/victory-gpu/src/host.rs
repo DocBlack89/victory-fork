@@ -1436,6 +1436,9 @@ struct CardWork {
     /// The ring lean windows' bytes go up through
     /// (`crate::shadow::lean_windows`), made with the first of them.
     ring: Option<Ring>,
+    /// A permanent VRAM zero tile and its tiny upload seed, kept alive
+    /// through its first submission. Recycled pool tiles need new zeros.
+    zero_tile: Option<(ID3D12Resource, ID3D12Resource)>,
 }
 
 /// One upload buffer (PC memory, mapped) that lean windows' changed bytes go
@@ -1498,6 +1501,10 @@ fn overlaps((a, b): (u64, u64), (c, d): (u64, u64)) -> bool {
 }
 
 #[cfg(test)]
+#[path = "lean_gpu_tests.rs"]
+mod lean_gpu_tests;
+
+#[cfg(test)]
 mod ring_tests {
     use super::{overlaps, ring_take};
 
@@ -1543,6 +1550,71 @@ mod ring_tests {
 
 /// A tile of a reserved buffer (`Host::reserved_buffer`).
 pub(crate) const TILE: u64 = 64 << 10;
+
+/// Seeds the immutable zero tile once, then uses it as a VRAM copy source.
+/// Keeping subsequent clears device-local avoids repeated PCIe reads.
+fn initialize_zero_tile(
+    list: &ID3D12GraphicsCommandList,
+    zero: &ID3D12Resource,
+    seed: &ID3D12Resource,
+) {
+    // SAFETY: both buffers hold TILE bytes and live through the plan.
+    unsafe {
+        list.CopyBufferRegion(zero, 0, seed, 0, TILE);
+        list.ResourceBarrier(&[transition(
+            zero,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+    }
+}
+
+/// Initializes newly assigned physical tiles before any partial upload.
+/// Reused tiles can hold another window's old bytes. Unsent bytes of a
+/// fresh window must read zero, including bytes outside the dirty range
+/// but inside its mapped tile. The source is one immutable zero tile.
+fn clear_new_tiles(
+    list: &ID3D12GraphicsCommandList,
+    resource: &ID3D12Resource,
+    maps: &[(u32, (u32, u32))],
+    zero: &ID3D12Resource,
+) {
+    if maps.is_empty() {
+        return;
+    }
+    // SAFETY: a live buffer, held by the submitting plan.
+    let width = unsafe { resource.GetDesc() }.Width;
+    for &(tile, _) in maps {
+        let at = u64::from(tile) * TILE;
+        let Some(bytes) = width
+            .checked_sub(at)
+            .map(|n| n.min(TILE))
+            .filter(|&n| n != 0)
+        else {
+            fail(format_args!(
+                "lean window tile {tile} is outside its {width}-byte buffer"
+            ));
+        };
+        // SAFETY: a mapped tile of the destination, clipped at its end;
+        // the source holds TILE zeros and both resources stay alive.
+        unsafe { list.CopyBufferRegion(resource, at, zero, 0, bytes) };
+    }
+    // Complete the zero writes before the dirty ranges overwrite their
+    // bytes. Both the initialization and the uploads use COPY_DEST.
+    // SAFETY: the copies above promoted this buffer to COPY_DEST.
+    unsafe {
+        list.ResourceBarrier(&[transition(
+            resource,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        list.ResourceBarrier(&[transition(
+            resource,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+    }
+}
 
 /// Tiles per heap of the tile pool: 64 MiB heaps.
 const HEAP_TILES: u32 = 1024;
@@ -3110,6 +3182,7 @@ impl Host {
                 taken: 0,
                 out: 0,
                 ring: None,
+                zero_tile: None,
             })
         }
     }
@@ -3135,6 +3208,18 @@ impl Host {
             event,
             value: 0,
         })
+    }
+
+    /// A device-local zero tile and its immutable CPU-side seed. Both are
+    /// only 64 KiB, independent of how many windows or tiles are made.
+    fn make_zero_tile(&self) -> Option<(ID3D12Resource, ID3D12Resource)> {
+        let zero = self.uav_buffer(TILE)?;
+        let (seed, data) = self.upload_buffer(TILE)?;
+        // SAFETY: the newly mapped upload buffer holds TILE bytes.
+        unsafe { data.write_bytes(0, TILE as usize) };
+        name(&zero, || "lean windows: immutable VRAM zero tile".into());
+        name(&seed, || "lean windows: zero tile seed".into());
+        Some((zero, seed))
     }
 
     /// Before a submission's lists run, for copies in the card's memory
@@ -3215,13 +3300,22 @@ impl Host {
         let mut ring = work.ring.take();
         // Lean windows' reserved buffers: the tiles the bytes about to go up
         // fall in get memory, mapped on the queue ahead of the copies.
+        let mut fresh_tiles = Vec::new();
         for (shadow, ranges) in &dirty {
             if shadow.lean() {
                 let maps = shadow.tiles_to_map(ranges, |n| self.take_tiles(n));
                 if !maps.is_empty() {
                     self.map_tiles(&shadow.buffer, &maps);
+                    fresh_tiles.push((shadow.clone(), maps));
                 }
             }
+        }
+        let seed_zero = !fresh_tiles.is_empty() && work.zero_tile.is_none();
+        if seed_zero {
+            let Some(zero) = self.make_zero_tile() else {
+                fail(format_args!("no zero tile for lean window initialization"));
+            };
+            work.zero_tile = Some(zero);
         }
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -3235,6 +3329,14 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    if let Some((zero, seed)) = &work.zero_tile {
+                        if seed_zero {
+                            initialize_zero_tile(list, zero, seed);
+                        }
+                        for (shadow, maps) in &fresh_tiles {
+                            clear_new_tiles(list, &shadow.buffer, maps, zero);
+                        }
+                    }
                     // This plan's bytes would go over its own, not sent yet:
                     // what is recorded so far runs and is waited for, and the
                     // list starts again.

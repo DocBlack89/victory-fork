@@ -124,9 +124,38 @@ fn tiles_of(ranges: &[(usize, usize)]) -> Vec<u32> {
     tiles
 }
 
+/// Assigns all missing tiles, or leaves the mapping unchanged if the
+/// allocator cannot supply the whole request. The error is the count
+/// needed: sending an upload without these tiles would silently drop it.
+fn missing_tile_mappings(
+    tiles: &mut [Option<(u32, u32)>],
+    ranges: &[(usize, usize)],
+    take: impl FnOnce(usize) -> Option<Vec<(u32, u32)>>,
+) -> Result<Vec<(u32, (u32, u32))>, usize> {
+    let wanted: Vec<u32> = tiles_of(ranges)
+        .into_iter()
+        .filter(|&t| tiles.get(t as usize).is_some_and(Option::is_none))
+        .collect();
+    let needed = wanted.len();
+    if needed == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(taken) = take(needed).filter(|taken| taken.len() == needed) else {
+        return Err(needed);
+    };
+    Ok(wanted
+        .into_iter()
+        .zip(taken)
+        .map(|(t, pooled)| {
+            tiles[t as usize] = Some(pooled);
+            (t, pooled)
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tiles_tests {
-    use super::tiles_of;
+    use super::{missing_tile_mappings, tiles_of};
     const T: usize = 64 << 10;
 
     /// A range inside one tile touches that tile; one across a boundary,
@@ -145,6 +174,43 @@ mod tiles_tests {
         assert_eq!(tiles_of(&[(3 * T, 3 * T + 5), (0, 1), (3 * T + 9, 4 * T + 1), (7, 7)]), vec![0, 3, 4]);
         assert!(tiles_of(&[]).is_empty());
         assert!(tiles_of(&[(5, 5)]).is_empty());
+    }
+
+    #[test]
+    fn failed_tile_allocation_leaves_every_mapping_unchanged() {
+        let original = [None, Some((4, 9)), None];
+        for allocation in [None, Some(vec![(2, 3)])] {
+            let mut tiles = original;
+            let result = missing_tile_mappings(&mut tiles, &[(0, 3 * T)], |needed| {
+                assert_eq!(needed, 2);
+                allocation
+            });
+            assert_eq!(result, Err(2));
+            assert_eq!(tiles, original);
+        }
+    }
+
+    #[test]
+    fn only_missing_tiles_are_assigned_once_for_partial_ranges() {
+        let mut tiles = [None, Some((4, 9)), None];
+        let ranges = [(T - 1, T + 1), (0, 1), (2 * T + 7, 2 * T + 8)];
+        let maps = missing_tile_mappings(&mut tiles, &ranges, |needed| {
+            assert_eq!(needed, 2);
+            Some(vec![(2, 3), (2, 4)])
+        })
+        .unwrap();
+        assert_eq!(maps, [(0, (2, 3)), (2, (2, 4))]);
+        assert_eq!(tiles, [Some((2, 3)), Some((4, 9)), Some((2, 4))]);
+        assert!(
+            missing_tile_mappings(&mut tiles, &ranges, |_| panic!("already mapped"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            missing_tile_mappings(&mut tiles, &[], |_| panic!("nothing requested"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -319,8 +385,8 @@ const LEAN_WINDOWS_MB: u64 = 8192;
 /// What it assumes: shaders write no window (run 91 of the fork's notes: "0.0
 /// MB compared in 0 ranges of windows"), since a write back to title memory
 /// needs the CPU side to tell the card's bytes from the title's. A write
-/// declared for a lean window is not compared or copied back; it is counted
-/// in the lean line instead. The ray-tracing structure builder declares
+/// declared for a lean window stops the run before submission, rather than
+/// silently dropping its copy-back. The ray-tracing structure builder declares
 /// writes for every copy it can reach, so `VICTORY_BVH_BUILDER=1` turns lean
 /// windows off.
 pub(crate) fn lean_windows() -> bool {
@@ -337,7 +403,7 @@ pub(crate) fn lean_windows() -> bool {
 
 /// Lean windows ([`lean_windows`]): made, bytes alive, bytes sent from title
 /// memory to the card since the last lean line, writes declared for them and
-/// left out since the start, plans whose upload ran in parts since the last
+/// rejected since the start, plans whose upload ran in parts since the last
 /// line (each part waited for).
 static LEAN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
@@ -363,7 +429,7 @@ pub(crate) fn lean_line() {
     tracing::info!(
         "lean windows (VICTORY_LEAN_WINDOWS): {} made, {:.0} MB alive on the card with no CPU side, of it {:.0} MB in \
          tiles mapped ({:.0} MB of heaps for tiles); {:.1} MB sent up from title memory since the last line, {} times \
-         a full upload buffer waited for; {} declared writes left out since the start",
+         a full upload buffer waited for; {} declared writes rejected since the start",
         LEAN[0].load(Ordering::Relaxed),
         mb(LEAN[1].load(Ordering::Relaxed)),
         mb(mapped),
@@ -1885,11 +1951,18 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        // A lean window has no CPU side to compare with ([`lean_windows`]):
-        // the write is counted, not declared.
+        // A lean window has no CPU side to compare with ([`lean_windows`]).
+        // Stop before the list can run with a write we cannot copy back.
         if self.lean() {
+            if len.min(self.left(address)) == 0 {
+                return;
+            }
             LEAN[3].fetch_add(1, Ordering::Relaxed);
-            return;
+            crate::host::fail(format_args!(
+                "a shader declared a write to lean window {:#x}+{:#x} at {address:#x}+{len:#x}; \
+                 stopped before submission because it has no copy-back reference; restart with VICTORY_LEAN_WINDOWS=0",
+                self.start, self.len,
+            ));
         }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -1904,8 +1977,8 @@ impl Shadow {
     /// buffer: the tiles they touch that have none mapped get one of the
     /// pool's (`take`: so many tiles, or `None`), returned as (tile, (heap,
     /// heap tile)) for the caller to map ahead of the copy. Empty for a
-    /// buffer that is not reserved. Without tiles from the pool the bytes
-    /// sent to those tiles are dropped by the card and read as zeros.
+    /// buffer that is not reserved. If the pool cannot supply every missing
+    /// tile, the run stops before uploading bytes that the card would drop.
     pub(crate) fn tiles_to_map(
         &self,
         ranges: &[(usize, usize)],
@@ -1915,28 +1988,13 @@ impl Shadow {
             return Vec::new();
         };
         let mut tiles = tiles.lock().unwrap_or_else(|e| e.into_inner());
-        let wanted: Vec<u32> = tiles_of(ranges)
-            .into_iter()
-            .filter(|&t| tiles.get(t as usize).is_some_and(Option::is_none))
-            .collect();
-        if wanted.is_empty() {
-            return Vec::new();
-        }
-        let Some(taken) = take(wanted.len()) else {
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, Ordering::Relaxed) {
-                tracing::warn!("lean windows: no tiles for a window's bytes; they read as zeros");
-            }
-            return Vec::new();
-        };
-        wanted
-            .into_iter()
-            .zip(taken)
-            .map(|(t, pooled)| {
-                tiles[t as usize] = Some(pooled);
-                (t, pooled)
-            })
-            .collect()
+        missing_tile_mappings(&mut tiles, ranges, take).unwrap_or_else(|needed| {
+            crate::host::fail(format_args!(
+                "lean window {:#x}+{:#x} needs {needed} tiles but allocation was incomplete; \
+                 stopped before upload; restart with VICTORY_LEAN_WINDOWS=0",
+                self.start, self.len,
+            ))
+        })
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
